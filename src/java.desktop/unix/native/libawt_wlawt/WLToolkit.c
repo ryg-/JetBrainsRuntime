@@ -35,6 +35,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <Trace.h>
+#include <assert.h>
 
 #include "jni_util.h"
 #include "sun_awt_wl_WLToolkit.h"
@@ -53,6 +54,32 @@ struct wl_shm *wl_shm = NULL;
 struct wl_compositor *wl_compositor = NULL;
 struct xdg_wm_base *xdg_wm_base = NULL;
 
+
+struct wl_seat     *wl_seat;
+struct wl_keyboard *wl_keyboard;
+struct wl_pointer  *wl_pointer;
+struct wl_touch    *wl_touch; // TODO: not used at the moment
+
+
+static jclass wlToolkitClass;
+static jmethodID dispatchPointerEventMID;
+static jclass pointerEventClass;
+static jmethodID pointerEventFactoryMID;
+static jfieldID hasEnterEventFID;
+static jfieldID hasLeaveEventFID;
+static jfieldID hasMotionEventFID;
+static jfieldID hasButtonEventFID;
+static jfieldID hasAxisEventFID;
+static jfieldID hasAxisSourceEventFID;
+static jfieldID hasAxisStopEventFID;
+static jfieldID hasAxisDiscreteEventFID;
+static jfieldID serialFID;
+static jfieldID surfacePtrFID;
+static jfieldID surfaceXFID;
+static jfieldID surfaceYFID;
+static jfieldID buttonCodeFID;
+static jfieldID isButtonPressedFID;
+
 JNIEnv *getEnv() {
     JNIEnv *env;
     // assuming we're always called from Java thread
@@ -68,6 +95,215 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
         .ping = xdg_wm_base_ping,
 };
 
+/**
+ * Accumulates all pointer events between two frame events.
+ */
+struct pointer_event_cumulative {
+    bool has_enter_event         : 1;
+    bool has_leave_event         : 1;
+    bool has_motion_event        : 1;
+    bool has_button_event        : 1;
+    bool has_axis_event          : 1;
+    bool has_axis_source_event   : 1;
+    bool has_axis_stop_event     : 1;
+    bool has_axis_discrete_event : 1;
+
+    uint32_t   time;
+    uint32_t   serial;
+    struct wl_surface* surface;
+
+    wl_fixed_t surface_x;
+    wl_fixed_t surface_y;
+
+    uint32_t   button;
+    uint32_t   state;
+
+    struct {
+        bool       valid;
+        wl_fixed_t value;
+        int32_t    discrete;
+    } axes[2];
+    uint32_t axis_source;
+};
+
+struct pointer_event_cumulative pointer_event;
+
+static void
+wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
+                 uint32_t serial, struct wl_surface *surface,
+                 wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+    pointer_event.has_enter_event = true;
+    pointer_event.serial    = serial;
+    pointer_event.surface   = surface;
+    pointer_event.surface_x = surface_x,
+    pointer_event.surface_y = surface_y;
+}
+
+static void
+wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
+                 uint32_t serial, struct wl_surface *surface)
+{
+    pointer_event.has_leave_event = true;
+    pointer_event.serial          = serial;
+    pointer_event.surface         = surface;
+}
+
+static void
+wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+                  wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+    pointer_event.has_motion_event = true;
+    pointer_event.time             = time;
+    pointer_event.surface_x        = surface_x,
+    pointer_event.surface_y        = surface_y;
+}
+
+static void
+wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
+                  uint32_t time, uint32_t button, uint32_t state)
+{
+    pointer_event.has_button_event = true;
+    pointer_event.time             = time;
+    pointer_event.serial           = serial;
+    pointer_event.button           = button,
+    pointer_event.state            = state;
+}
+
+static void
+wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+                uint32_t axis, wl_fixed_t value)
+{
+    assert(axis < sizeof(pointer_event.axes)/sizeof(pointer_event.axes[0]));
+
+    pointer_event.has_axis_event   = true;
+    pointer_event.time             = time;
+    pointer_event.axes[axis].valid = true;
+    pointer_event.axes[axis].value = value;
+}
+
+static void
+wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
+                       uint32_t axis_source)
+{
+    pointer_event.has_axis_source_event = true;
+    pointer_event.axis_source           = axis_source;
+}
+
+static void
+wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
+                     uint32_t time, uint32_t axis)
+{
+    assert(axis < sizeof(pointer_event.axes)/sizeof(pointer_event.axes[0]));
+
+    pointer_event.has_axis_stop_event = true;
+    pointer_event.time                = time;
+    pointer_event.axes[axis].valid    = true;
+}
+
+static void
+wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+                         uint32_t axis, int32_t discrete)
+{
+    pointer_event.has_axis_discrete_event = true;
+    pointer_event.axes[axis].valid        = true;
+    pointer_event.axes[axis].discrete     = discrete;
+}
+
+static inline void
+reset_pointer_event(struct pointer_event_cumulative *e)
+{
+    struct wl_surface* const event_surface = e->surface;
+    memset(e, 0, sizeof(struct pointer_event_cumulative));
+    // Save the surface pointer between events because only enter/leave ones have it
+    // and yet we must be able to find which window the event appertains to.
+    e->surface = event_surface;
+}
+
+static void
+fill_java_pointer_event(JNIEnv* env, jobject pointerEventRef)
+{
+    (*env)->SetBooleanField(env, pointerEventRef, hasEnterEventFID, pointer_event.has_enter_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasLeaveEventFID, pointer_event.has_leave_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasMotionEventFID, pointer_event.has_motion_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasButtonEventFID, pointer_event.has_button_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasAxisEventFID, pointer_event.has_axis_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasAxisSourceEventFID, pointer_event.has_axis_source_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasAxisStopEventFID, pointer_event.has_axis_stop_event);
+    (*env)->SetBooleanField(env, pointerEventRef, hasAxisDiscreteEventFID, pointer_event.has_axis_discrete_event);
+
+    (*env)->SetLongField(env, pointerEventRef, serialFID, pointer_event.serial);
+
+    (*env)->SetIntField(env, pointerEventRef, surfaceXFID, wl_fixed_to_int(pointer_event.surface_x));
+    (*env)->SetIntField(env, pointerEventRef, surfaceYFID, wl_fixed_to_int(pointer_event.surface_y));
+
+    (*env)->SetIntField(env, pointerEventRef, buttonCodeFID, (jint)pointer_event.button);
+    (*env)->SetBooleanField(env, pointerEventRef, isButtonPressedFID,
+                            (pointer_event.state == WL_POINTER_BUTTON_STATE_PRESSED));
+
+    // TODO: axis events
+}
+
+static void
+wl_pointer_frame(void *data, struct wl_pointer *wl_pointer)
+{
+    J2dTrace1(J2D_TRACE_INFO, "WLToolkit: pointer_frame event for surface %p\n", wl_pointer);
+
+    JNIEnv* env = getEnv();
+    jobject pointerEventRef = (*env)->CallStaticObjectMethod(env,
+                                                             pointerEventClass,
+                                                             pointerEventFactoryMID,
+                                                             (jlong)pointer_event.surface);
+    JNU_CHECK_EXCEPTION(env);
+
+    fill_java_pointer_event(env, pointerEventRef);
+    (*env)->CallStaticVoidMethod(env,
+                                 wlToolkitClass,
+                                 dispatchPointerEventMID,
+                                 pointerEventRef);
+    JNU_CHECK_EXCEPTION(env);
+
+    reset_pointer_event(&pointer_event);
+}
+
+static const struct wl_pointer_listener wl_pointer_listener = {
+        .enter         = wl_pointer_enter,
+        .leave         = wl_pointer_leave,
+        .motion        = wl_pointer_motion,
+        .button        = wl_pointer_button,
+        .axis          = wl_pointer_axis,
+        .frame         = wl_pointer_frame,
+        .axis_source   = wl_pointer_axis_source,
+        .axis_stop     = wl_pointer_axis_stop,
+        .axis_discrete = wl_pointer_axis_discrete
+};
+
+static void
+wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities)
+{
+    const bool has_pointer  = capabilities & WL_SEAT_CAPABILITY_POINTER;
+    const bool has_keyboard = capabilities & WL_SEAT_CAPABILITY_KEYBOARD;
+
+    if (has_pointer && wl_pointer == NULL) {
+        wl_pointer = wl_seat_get_pointer(wl_seat);
+        wl_pointer_add_listener(wl_pointer, &wl_pointer_listener, NULL);
+    } else if (!has_pointer && wl_pointer != NULL) {
+        wl_pointer_release(wl_pointer);
+        wl_pointer = NULL;
+    }
+}
+
+static void
+wl_seat_name(void *data, struct wl_seat *wl_seat, const char *name)
+{
+    J2dTrace1(J2D_TRACE_INFO, "WLToolkit: seat name '%s'\n", name);
+}
+
+static const struct wl_seat_listener wl_seat_listener = {
+        .capabilities = wl_seat_capabilities,
+        .name = wl_seat_name
+};
+
 static void registry_global(void *data, struct wl_registry *wl_registry,
                             uint32_t name, const char *interface, uint32_t version) {
     if (strcmp(interface, wl_shm_interface.name) == 0) {
@@ -77,6 +313,9 @@ static void registry_global(void *data, struct wl_registry *wl_registry,
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         xdg_wm_base = wl_registry_bind(wl_registry, name, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(xdg_wm_base, &xdg_wm_base_listener, NULL);
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        wl_seat = wl_registry_bind(wl_registry, name, &wl_seat_interface, 5);
+        wl_seat_add_listener(wl_seat, &wl_seat_listener, NULL);
     }
 #ifdef WAKEFIELD_ROBOT
     else if (strcmp(interface, wakefield_interface.name) == 0) {
@@ -104,6 +343,50 @@ static const struct wl_registry_listener wl_registry_listener = {
         .global_remove = registry_global_remove,
 };
 
+static jboolean
+initJavaRefs(JNIEnv *env, jclass clazz)
+{
+    CHECK_NULL_RETURN(wlToolkitClass = (jclass)(*env)->NewGlobalRef(env, clazz), JNI_FALSE);
+    CHECK_NULL_RETURN(dispatchPointerEventMID = (*env)->GetStaticMethodID(env, wlToolkitClass,
+                                                                          "dispatchPointerEvent",
+                                                                          "(Lsun/awt/wl/WLToolkit$PointerEvent;)V"),
+                      JNI_FALSE);
+
+    CHECK_NULL_RETURN(pointerEventClass = (*env)->FindClass(env,
+                                                            "sun/awt/wl/WLToolkit$PointerEvent"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(pointerEventFactoryMID = (*env)->GetStaticMethodID(env, pointerEventClass,
+                                                                         "of",
+                                                                         "(J)Lsun/awt/wl/WLToolkit$PointerEvent;"),
+                      JNI_FALSE);
+
+    CHECK_NULL_RETURN(hasEnterEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_enter_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasLeaveEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_leave_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasMotionEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_motion_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasButtonEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_button_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasAxisEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_axis_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasAxisSourceEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_axis_source_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasAxisStopEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_axis_stop_event", "Z"),
+                      JNI_FALSE);
+    CHECK_NULL_RETURN(hasAxisDiscreteEventFID = (*env)->GetFieldID(env, pointerEventClass, "has_axis_discrete_event", "Z"),
+                      JNI_FALSE);
+
+    CHECK_NULL_RETURN(serialFID = (*env)->GetFieldID(env, pointerEventClass, "serial", "J"), JNI_FALSE);
+    CHECK_NULL_RETURN(surfacePtrFID = (*env)->GetFieldID(env, pointerEventClass, "surfacePtr", "J"), JNI_FALSE);
+    CHECK_NULL_RETURN(surfaceXFID = (*env)->GetFieldID(env, pointerEventClass, "surface_x", "I"), JNI_FALSE);
+    CHECK_NULL_RETURN(surfaceYFID = (*env)->GetFieldID(env, pointerEventClass, "surface_y", "I"), JNI_FALSE);
+    CHECK_NULL_RETURN(buttonCodeFID = (*env)->GetFieldID(env, pointerEventClass, "buttonCode", "I"), JNI_FALSE);
+    CHECK_NULL_RETURN(isButtonPressedFID = (*env)->GetFieldID(env, pointerEventClass, "isButtonPressed", "Z"), JNI_FALSE);
+
+    return JNI_TRUE;
+}
+
 JNIEXPORT void JNICALL
 Java_sun_awt_wl_WLToolkit_initIDs
   (JNIEnv *env, jclass clazz)
@@ -112,6 +395,11 @@ Java_sun_awt_wl_WLToolkit_initIDs
     if (!wl_display) {
         J2dTrace(J2D_TRACE_ERROR, "WLToolkit: Failed to connect to Wayland display\n");
         JNU_ThrowByName(env, "java/awt/AWTError", "Can't connect to the Wayland server");
+        return;
+    }
+
+    if (!initJavaRefs(env, clazz)) {
+        JNU_ThrowInternalError(env, "Failed to find Wayland toolkit internal classes");
         return;
     }
 

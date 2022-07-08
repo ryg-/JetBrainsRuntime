@@ -43,7 +43,6 @@ import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.SystemColor;
 import java.awt.Toolkit;
-import java.awt.Window;
 import java.awt.event.FocusEvent;
 import java.awt.event.InputEvent;
 import java.awt.event.InputMethodEvent;
@@ -213,6 +212,7 @@ public class WLComponentPeer implements ComponentPeer
         this.visible = v;
         if (this.visible) {
             nativeShowComponent(nativePtr, getParentNativePtr(target), target.getX(), target.getY());
+            WLToolkit.registerWLSurface(getWLSurface(), this);
             ((WLSurfaceData)surfaceData).initSurface(this, background != null ? background.getRGB() : 0, target.getWidth(), target.getHeight());
             PaintEvent event = PaintEventDispatcher.getPaintEventDispatcher().
                     createPaintEvent(target, 0, 0, target.getWidth(), target.getHeight());
@@ -220,6 +220,7 @@ public class WLComponentPeer implements ComponentPeer
                 WLToolkit.postEvent(WLToolkit.targetToAppContext(event.getSource()), event);
             }
         } else {
+            WLToolkit.unregisterWLSurface(getWLSurface());
             nativeHideFrame(nativePtr);
         }
     }
@@ -388,6 +389,50 @@ public class WLComponentPeer implements ComponentPeer
                 break;
         }
     }
+    
+    private void dispatchEnterEvent(WLToolkit.PointerEvent e) {
+        final Component source = getEventSource();
+        final long when = System.currentTimeMillis();
+        final int modifiers = 0; // TODO
+        final MouseEvent mouseEvent = new MouseEvent(source, MouseEvent.MOUSE_ENTERED, when,
+                modifiers,
+                e.surface_x, e.surface_y,
+                e.surface_x, e.surface_y,
+                0, false, MouseEvent.NOBUTTON);
+        postEvent(mouseEvent);
+    }
+
+    private void dispatchLeaveEvent(WLToolkit.PointerEvent e) {
+        final Component source = getEventSource();
+        final long when = System.currentTimeMillis();
+        // TODO: leave event has no coordinates
+
+        final int modifiers = 0; // TODO
+        final MouseEvent mouseEvent = new MouseEvent(source, MouseEvent.MOUSE_EXITED, when,
+                modifiers,
+                e.surface_x, e.surface_y,
+                e.surface_x, e.surface_y,
+                0, false, MouseEvent.NOBUTTON);
+        postEvent(mouseEvent);
+    }
+
+    void dispatchPointerEvent(WLToolkit.PointerEvent e) {
+        if (e.has_enter_event) {
+            dispatchEnterEvent(e);
+        }
+
+        if (e.has_leave_event) {
+            dispatchLeaveEvent(e);
+        }
+    }
+
+    private int getModifiers(WLToolkit.PointerEvent e) {
+        return 0; // TODO: see XWindow.getModifiers()
+    }
+
+    public Component getEventSource() {
+        return target;
+    }
 
     public void beginLayout() {
         // Skip all painting till endLayout
@@ -450,6 +495,7 @@ public class WLComponentPeer implements ComponentPeer
 
     @Override
     public void dispose() {
+        WLToolkit.unregisterWLSurface(getWLSurface());
         nativeDisposeFrame(nativePtr);
     }
 

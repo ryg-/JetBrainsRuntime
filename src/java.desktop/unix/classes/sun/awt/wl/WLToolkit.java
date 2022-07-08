@@ -66,10 +66,17 @@ import java.awt.peer.TextFieldPeer;
 import java.awt.peer.TrayIconPeer;
 import java.awt.peer.WindowPeer;
 import java.beans.PropertyChangeListener;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.Map;
 import java.util.Properties;
 
-import sun.awt.*;
+import sun.awt.AppContext;
+import sun.awt.LightweightFrame;
+import sun.awt.PeerEvent;
+import sun.awt.SunToolkit;
+import sun.awt.UNIXToolkit;
 import sun.awt.datatransfer.DataTransferer;
 import sun.util.logging.PlatformLogger;
 
@@ -205,6 +212,112 @@ public class WLToolkit extends UNIXToolkit implements Runnable {
                 }
             }
         }
+    }
+
+    static class PointerEvent {
+        // Taken from <linux/input-event-codes.h>
+        public static final int BTN_LEFT   = 0x110;
+        public static final int BTN_RIGHT  = 0x111;
+        public static final int BTN_MIDDLE = 0x112;
+
+        final long surfacePtr; /// 'struct wl_surface *' this event appertains to
+
+        boolean has_enter_event;
+        boolean has_leave_event;
+        boolean has_motion_event;
+        boolean has_button_event;
+        boolean has_axis_event;
+        boolean has_axis_source_event;
+        boolean has_axis_stop_event;
+        boolean has_axis_discrete_event;
+
+        long    serial;
+
+        int     surface_x;
+        int     surface_y;
+
+        int     buttonCode;
+        boolean isButtonPressed;
+
+        private PointerEvent(long surfacePtr) {
+            this.surfacePtr = surfacePtr;
+        }
+
+        static PointerEvent of(long surfacePtr) {
+            return new PointerEvent(surfacePtr);
+        }
+
+        @Override
+        public String toString() {
+            final StringBuilder builder = new StringBuilder();
+            builder.append("PointerEvent(");
+            builder.append("surface: 0x").append(HexFormat.of().toHexDigits(surfacePtr));
+            if (has_enter_event || has_leave_event || has_button_event) {
+                builder.append(", serial: ").append(serial);
+            }
+
+            if (has_enter_event) builder.append(" enter");
+            if (has_leave_event) builder.append(" leave");
+
+            if (has_motion_event) {
+                builder.append(" motion ");
+                builder.append("x: ").append(surface_x).append(", y: ").append(surface_y);
+
+            }
+            if (has_button_event) {
+                builder.append(" button ");
+                // see <linux/input-event-codes.h>
+                builder.append(buttonCodeToString(buttonCode)).append(" ");
+                builder.append(isButtonPressed ? "pressed" : "released");
+            }
+
+            // TODO
+            if (has_axis_event) builder.append("axis");
+            if (has_axis_source_event) builder.append("axis-source");
+            if (has_axis_stop_event) builder.append("axis-stop");
+            if (has_axis_discrete_event) builder.append("axis_discrete");
+
+            builder.append(")");
+
+            return builder.toString();
+        }
+
+        public static String buttonCodeToString(int code) {
+            return switch (code) {
+                case BTN_LEFT   -> "left";
+                case BTN_MIDDLE -> "middle";
+                case BTN_RIGHT  -> "right";
+                default         -> "unrecognized";
+            };
+        }
+    }
+
+    private static void dispatchPointerEvent(PointerEvent e) {
+        // Invoked from the native code
+        assert EventQueue.isDispatchThread();
+        System.out.println(e);
+
+        final WLComponentPeer peer = wlSurfaceToComponentMap.get(e.surfacePtr);
+        if (peer == null) throw new InternalError("Surface doesn't map to any WLComponentPeer");
+
+        System.out.println("for peer " + peer);
+
+        peer.dispatchPointerEvent(e);
+        // WLToolkit.postEvent(WLToolkit.targetToAppContext(event.getSource()), event);
+    }
+
+    /**
+     * Maps 'struct wl_surface*' to WLComponentPeer that owns the Wayland surface.
+     */
+    static Map<Long, WLComponentPeer> wlSurfaceToComponentMap = Collections.synchronizedMap(new HashMap<>());
+
+    static void registerWLSurface(long wlSurfacePtr, WLComponentPeer componentPeer) {
+        System.out.println("0x" + HexFormat.of().toHexDigits(wlSurfacePtr) + "->" + componentPeer);
+        wlSurfaceToComponentMap.put(wlSurfacePtr, componentPeer);
+    }
+
+    static void unregisterWLSurface(long wlSurfacePtr) {
+        wlSurfaceToComponentMap.remove(wlSurfacePtr);
     }
 
     @Override
